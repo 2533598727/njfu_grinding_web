@@ -20,7 +20,7 @@ PASSWORD = ""
 EXAM_URL = "http://202.119.208.57/servlet/pc/ExamCaseController?exam_id=0f770163-73fe-4328-861a-dfd15ce26726"
 LOOP_COUNT = 91
 BASE_URL = "http://202.119.208.57"
-HEADLESS = True  # 设置为 True 启用无头模式（看不到浏览器窗口）
+HEADLESS = True  # 设置为 True 启用无头模式
 USE_EDGE = True   # 设置为 True 使用 Edge 浏览器，False 使用 Chrome
 # WebDriver 获取策略: 'auto' (自动尝试所有), 'manager' (仅 webdriver-manager), 'system' (仅系统路径), 'local' (仅本地文件)
 DRIVER_STRATEGY = 'auto'
@@ -639,6 +639,7 @@ if __name__ == "__main__":
         print(f"\n\n❌ 程序异常退出: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
