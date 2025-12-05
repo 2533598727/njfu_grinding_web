@@ -258,7 +258,7 @@ python scraper.py
 </div>
 
 ---
-## ⭐ Star 历史图
+## ⭐ Star图
 
 <div align="center">
   <a href="https://api.star-history.com/charts.html?repos=keggin-CHN/njfu_grinding" target="_blank" rel="noopener">
