@@ -1,9 +1,6 @@
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.edge.options import Options as EdgeOptions
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 import matplotlib
@@ -13,36 +10,390 @@ import json
 import re
 import time
 import os
+from urllib.parse import urljoin, urlparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # --- 宏定义 ---
 USERNAME = ""
 PASSWORD = ""
 EXAM_URL = "http://202.119.208.57/servlet/pc/ExamCaseController?exam_id=0f770163-73fe-4328-861a-dfd15ce26726"
-LOOP_COUNT = 91
+LOOP_COUNT = 50
 BASE_URL = "http://202.119.208.57"
-HEADLESS = True  # 设置为 True 启用无头模式
-USE_EDGE = True   # 设置为 True 使用 Edge 浏览器，False 使用 Chrome
-# WebDriver 获取策略: 'auto' (自动尝试所有), 'manager' (仅 webdriver-manager), 'system' (仅系统路径), 'local' (仅本地文件)
-DRIVER_STRATEGY = 'auto'
+DEBUG = False  
+PARALLEL_WORKERS = 6
 # --- 宏定义结束 ---
 
 QUESTION_BANK_FILE = 'question_bank.json'
 
-def get_user_input():
-    global USERNAME, PASSWORD, EXAM_URL, LOOP_COUNT
-    if not USERNAME:
-        USERNAME = input("请输入您的用户名: ")
-    if not PASSWORD:
-        PASSWORD = input("请输入您的密码: ")
-    if not EXAM_URL:
-        EXAM_URL = input("请输入考试的 URL: ")
-    if LOOP_COUNT is None:
-        while True:
-            try:
-                LOOP_COUNT = int(input("请输入循环次数: "))
-                break
-            except ValueError:
-                print("请输入一个有效的数字。")
+question_bank_lock = threading.Lock()
+
+
+class ExamCrawler:
+    
+    def __init__(self, worker_id=0):
+        self.worker_id = worker_id
+        self.session = requests.Session()
+        
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,
+            pool_maxsize=10
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0',
+        })
+        self.logged_in = False
+        self.current_url = None
+    
+    def _log(self, msg):
+        if PARALLEL_WORKERS > 1:
+            print(f"[Worker {self.worker_id}] {msg}")
+        else:
+            print(msg)
+    
+    def _save_debug(self, filename, content, prefix="debug_"):
+        if DEBUG:
+            filepath = f"{prefix}w{self.worker_id}_{filename}"
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(content)
+            self._log(f"  [DEBUG] 已保存到 {filepath}")
+    
+    def _get_soup(self, html):
+        return BeautifulSoup(html, 'html.parser')
+    
+    def _extract_viewstate(self, soup):
+        vs = soup.find('input', {'name': 'javax.faces.ViewState'})
+        if vs:
+            return vs.get('value', '')
+        vs = soup.find('input', {'id': re.compile(r'.*ViewState.*', re.I)})
+        if vs:
+            return vs.get('value', '')
+        return None
+    
+    def _extract_form_data(self, soup, form_id=None):
+        if form_id:
+            form = soup.find('form', {'id': form_id})
+        else:
+            form = soup.find('form')
+        
+        if not form:
+            return {}, None
+        
+        form_action = form.get('action', '')
+        fields = {}
+        
+        for inp in form.find_all('input'):
+            name = inp.get('name')
+            if name:
+                input_type = inp.get('type', 'text').lower()
+                if input_type == 'checkbox' or input_type == 'radio':
+                    if inp.get('checked'):
+                        fields[name] = inp.get('value', 'on')
+                else:
+                    fields[name] = inp.get('value', '')
+        
+        for select in form.find_all('select'):
+            name = select.get('name')
+            if name:
+                selected_option = select.find('option', selected=True)
+                if selected_option:
+                    fields[name] = selected_option.get('value', '')
+                else:
+                    first_option = select.find('option')
+                    if first_option:
+                        fields[name] = first_option.get('value', '')
+        
+        for textarea in form.find_all('textarea'):
+            name = textarea.get('name')
+            if name:
+                fields[name] = textarea.get_text()
+        
+        return fields, form_action
+    
+    def _make_absolute_url(self, url, base=None):
+        if not url:
+            return base or BASE_URL
+        if url.startswith('http'):
+            return url
+        return urljoin(base or BASE_URL, url)
+    
+    def login(self, username, password):
+        self._log("步骤 1/6: 访问登录页面...")
+        
+        try:
+            resp = self.session.get(f"{BASE_URL}/", timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            self._log(f"❌ 无法访问登录页面: {e}")
+            return False
+        
+        self._save_debug('login_page.html', resp.text)
+        self.current_url = resp.url
+        
+        soup = self._get_soup(resp.text)
+        
+        login_form = soup.find('form')
+        if not login_form:
+            self._log("❌ 未找到登录表单")
+            return False
+        
+        form_id = login_form.get('id', '')
+        form_action = login_form.get('action', '')
+        self._log(f"  找到表单: id='{form_id}', action='{form_action}'")
+        
+        username_input = None
+        password_input = None
+        
+        for inp in soup.find_all('input'):
+            inp_id = inp.get('id', '').lower()
+            inp_name = inp.get('name', '').lower()
+            inp_type = inp.get('type', '').lower()
+            
+            if not username_input:
+                if 'urn' in inp_id or 'user' in inp_id or 'name' in inp_id or 'account' in inp_id:
+                    if inp_type != 'password':
+                        username_input = inp
+                elif 'urn' in inp_name or 'user' in inp_name or 'name' in inp_name or 'account' in inp_name:
+                    if inp_type != 'password':
+                        username_input = inp
+            
+            if not password_input:
+                if inp_type == 'password':
+                    password_input = inp
+                elif 'pwd' in inp_id or 'pass' in inp_id:
+                    password_input = inp
+                elif 'pwd' in inp_name or 'pass' in inp_name:
+                    password_input = inp
+        
+        if not username_input or not password_input:
+            self._log("❌ 未找到用户名或密码输入框")
+            return False
+        
+        username_name = username_input.get('name')
+        password_name = password_input.get('name')
+        self._log(f"  用户名字段: {username_name}")
+        self._log(f"  密码字段: {password_name}")
+        
+        self._log("步骤 2/6: 准备登录数据...")
+        form_data, _ = self._extract_form_data(soup, form_id if form_id else None)
+        
+        form_data[username_name] = username
+        form_data[password_name] = password
+        
+        login_button = soup.find('button', {'id': re.compile(r'.*login.*', re.I)})
+        if not login_button:
+            login_button = soup.find('button', {'type': 'submit'})
+        if not login_button:
+            login_button = soup.find('input', {'type': 'submit'})
+        
+        if login_button:
+            btn_name = login_button.get('name')
+            btn_id = login_button.get('id')
+            if btn_name:
+                form_data[btn_name] = login_button.get('value', '')
+            if btn_id and ':' in btn_id:
+                form_data[btn_id] = ''
+            self._log(f"  登录按钮: id='{btn_id}' name='{btn_name}'")
+        
+        submit_url = self._make_absolute_url(form_action, resp.url)
+        self._log(f"  提交 URL: {submit_url}")
+        
+        self._log("步骤 3/6: 提交登录请求...")
+        self.session.headers['Referer'] = resp.url
+        self.session.headers['Origin'] = BASE_URL
+        
+        try:
+            resp = self.session.post(submit_url, data=form_data, timeout=15, allow_redirects=True)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            self._log(f"❌ 登录请求失败: {e}")
+            return False
+        
+        self._save_debug('after_login.html', resp.text)
+        self.current_url = resp.url
+        self._log(f"  登录后 URL: {resp.url}")
+        
+        if "Default.jspx" in resp.url or "talk" in resp.url:
+            self._log("✅ 登录成功！")
+            self.logged_in = True
+            return True
+        
+        soup = self._get_soup(resp.text)
+        
+        logout_link = soup.find('a', href=re.compile(r'logout|signout|exit', re.I))
+        if logout_link:
+            self._log("✅ 登录成功！（检测到退出链接）")
+            self.logged_in = True
+            return True
+        
+        error_patterns = [
+            soup.find(class_=re.compile(r'error|alert-danger|warning', re.I)),
+            soup.find(id=re.compile(r'error|message', re.I)),
+            soup.find(string=re.compile(r'用户名.*错误|密码.*错误|登录失败', re.I))
+        ]
+        
+        for error in error_patterns:
+            if error:
+                error_text = error.get_text(strip=True) if hasattr(error, 'get_text') else str(error)
+                self._log(f"❌ 登录失败: {error_text[:100]}")
+                return False
+        
+        if resp.url != f"{BASE_URL}/" and len(resp.url) > len(BASE_URL) + 5:
+            self._log("✅ 登录可能成功（URL 已变化）")
+            self.logged_in = True
+            return True
+        
+        self._log(f"⚠️ 登录状态不确定，当前 URL: {resp.url}")
+        return False
+    
+    def do_exam(self):
+        if not self.logged_in:
+            self._log("❌ 请先登录")
+            return None
+        
+        self._log(f"步骤 4/6: 访问考试页面...")
+        
+        self.session.headers['Referer'] = self.current_url or BASE_URL
+        
+        try:
+            resp = self.session.get(EXAM_URL, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            self._log(f"❌ 无法访问考试页面: {e}")
+            return None
+        
+        self._save_debug('exam_page.html', resp.text)
+        self.current_url = resp.url
+        
+        soup = self._get_soup(resp.text)
+        
+        start_button = soup.find('button', onclick=re.compile(r'begin', re.I))
+        if start_button:
+            self._log("  发现'开始考试'按钮，尝试处理...")
+            
+            btn_id = start_button.get('id', '')
+            btn_name = start_button.get('name', '')
+            
+            if btn_id or btn_name:
+                form_data, form_action = self._extract_form_data(soup)
+                viewstate = self._extract_viewstate(soup)
+                
+                if viewstate:
+                    form_data['javax.faces.ViewState'] = viewstate
+                
+                if btn_id:
+                    form_data[btn_id] = ''
+                if btn_name:
+                    form_data[btn_name] = ''
+                
+                submit_url = self._make_absolute_url(form_action, resp.url)
+                
+                try:
+                    resp = self.session.post(submit_url, data=form_data, timeout=15, allow_redirects=True)
+                    resp.raise_for_status()
+                    soup = self._get_soup(resp.text)
+                    self._save_debug('after_start.html', resp.text)
+                except requests.RequestException as e:
+                    self._log(f"  ⚠️ 点击开始按钮失败: {e}")
+        
+        my_form = soup.find('form', {'id': 'myForm'})
+        if my_form:
+            self._log("✅ 找到考试表单 (myForm)")
+        else:
+            if "ExamCaseReport" in resp.url or "Report" in resp.url:
+                return resp.text
+        
+        self._log("步骤 5/6: 提交试卷...")
+        
+        form_data, form_action = self._extract_form_data(soup, 'myForm')
+        viewstate = self._extract_viewstate(soup)
+        
+        if viewstate:
+            form_data['javax.faces.ViewState'] = viewstate
+        
+        submit_button = soup.find('button', {'id': 'myForm:subcase'})
+        if submit_button:
+            form_data['myForm:subcase'] = ''
+        else:
+            submit_button = soup.find('button', string=re.compile(r'提交'))
+            if submit_button:
+                btn_id = submit_button.get('id', '')
+                btn_name = submit_button.get('name', '')
+                if btn_id:
+                    form_data[btn_id] = ''
+                if btn_name:
+                    form_data[btn_name] = ''
+            else:
+                form_data['myForm:subcase'] = ''
+        
+        submit_url = self._make_absolute_url(form_action, resp.url)
+        
+        self.session.headers['Referer'] = resp.url
+        
+        try:
+            resp = self.session.post(submit_url, data=form_data, timeout=15, allow_redirects=True)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            self._log(f"❌ 提交请求失败: {e}")
+            return None
+        
+        self._save_debug('after_submit.html', resp.text)
+        self.current_url = resp.url
+        
+        soup = self._get_soup(resp.text)
+        
+        if "ExamCaseResult" in resp.url or "ExamCaseReport" in resp.url or "Report" in resp.url:
+            self._log("✅ 步骤 6/6: 成功进入报告页面!")
+            
+            if "ExamCaseResult" in resp.url:
+                soup = self._get_soup(resp.text)
+                view_details = soup.find('button', string=re.compile(r'查看详情'))
+                if view_details:
+                    onclick = view_details.get('onclick', '')
+                    
+                    url_match = re.search(r"window\.open\(['\"]([^'\"]+)['\"]", onclick)
+                    if url_match:
+                        report_path = url_match.group(1)
+                        report_path = report_path.replace('\\/', '/')
+                        report_url = self._make_absolute_url(report_path, resp.url)
+                        
+                        try:
+                            self.session.headers['Referer'] = resp.url
+                            resp = self.session.get(report_url, timeout=15, allow_redirects=True)
+                            resp.raise_for_status()
+                            self._save_debug('report_page.html', resp.text)
+                            self._log(f"  ✅ 成功获取报告页面")
+                            return resp.text
+                        except requests.RequestException as e:
+                            self._log(f"  ⚠️ 获取报告页面失败: {e}")
+            
+            return resp.text
+        
+        if soup.find(class_='ui-panel-content') or soup.find(string=re.compile(r'正确答案')):
+            self._log("✅ 步骤 6/6: 页面包含报告内容!")
+            return resp.text
+        
+        self._log(f"❌ 未能跳转到报告页面")
+        return None
+    
+    def close(self):
+        self.session.close()
+
 
 def load_question_bank():
     if os.path.exists(QUESTION_BANK_FILE):
@@ -61,6 +412,7 @@ def load_question_bank():
             print(f"警告: {QUESTION_BANK_FILE} 文件格式错误，将创建一个新的题库。")
             return {}
     return {}
+
 
 def save_question_bank(bank):
     categorized_bank = {
@@ -91,278 +443,6 @@ def save_question_bank(bank):
         json.dump(categorized_bank, f, ensure_ascii=False, indent=4)
     print(f"题库已成功保存到 {QUESTION_BANK_FILE} (已分类)")
 
-def create_driver():
-    browser_name = "Edge" if USE_EDGE else "Chrome"
-    print(f"  正在配置 {browser_name} 浏览器...")
-    if USE_EDGE:
-        options = EdgeOptions()
-    else:
-        options = ChromeOptions()
-    if HEADLESS:
-        options.add_argument('--headless')
-        options.add_argument('--disable-gpu')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-    options.add_argument('--window-size=1920,1080')
-    options.add_experimental_option('excludeSwitches', ['enable-automation'])
-    options.add_experimental_option('useAutomationExtension', False)
-    options.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
-    driver = None
-    if USE_EDGE:
-        if DRIVER_STRATEGY in ['auto', 'manager']:
-            try:
-                from selenium.webdriver.edge.service import Service
-                from webdriver_manager.microsoft import EdgeChromiumDriverManager
-                print("  尝试使用 webdriver-manager 自动管理 EdgeDriver...")
-                service = Service(EdgeChromiumDriverManager().install())
-                driver = webdriver.Edge(service=service, options=options)
-                print("  ✓ 使用 webdriver-manager 成功")
-            except ImportError:
-                print("  ⚠️ webdriver-manager 未安装，尝试其他方法...")
-                print("  提示: 运行 'pip install webdriver-manager' 可自动管理 EdgeDriver")
-            except Exception as e:
-                print(f"  ⚠️ webdriver-manager 失败: {e}")
-        if driver is None and DRIVER_STRATEGY in ['auto', 'system']:
-            try:
-                print("  尝试使用系统内置的 EdgeDriver...")
-                driver = webdriver.Edge(options=options)
-                print("  ✓ 使用系统 EdgeDriver 成功")
-            except Exception as e:
-                print(f"  ⚠️ 系统 EdgeDriver 失败: {e}")
-        if driver is None and DRIVER_STRATEGY in ['auto', 'local']:
-            try:
-                from selenium.webdriver.edge.service import Service
-                local_driver_path = os.path.join(os.path.dirname(__file__), 'msedgedriver.exe')
-                if os.path.exists(local_driver_path):
-                    print(f"  尝试使用本地 EdgeDriver: {local_driver_path}")
-                    service = Service(local_driver_path)
-                    driver = webdriver.Edge(service=service, options=options)
-                    print("  ✓ 使用本地 EdgeDriver 成功")
-                else:
-                    if DRIVER_STRATEGY == 'local':
-                        print(f"  ⚠️ 本地未找到 msedgedriver.exe")
-            except Exception as e:
-                print(f"  ⚠️ 本地 EdgeDriver 失败: {e}")
-    else:
-        if DRIVER_STRATEGY in ['auto', 'manager']:
-            try:
-                from selenium.webdriver.chrome.service import Service
-                from webdriver_manager.chrome import ChromeDriverManager
-                print("  尝试使用 webdriver-manager 自动管理 ChromeDriver...")
-                service = Service(ChromeDriverManager().install())
-                driver = webdriver.Chrome(service=service, options=options)
-                print("  ✓ 使用 webdriver-manager 成功")
-            except ImportError:
-                print("  ⚠️ webdriver-manager 未安装，尝试其他方法...")
-                print("  提示: 运行 'pip install webdriver-manager' 可自动管理 ChromeDriver")
-            except Exception as e:
-                print(f"  ⚠️ webdriver-manager 失败: {e}")
-        if driver is None and DRIVER_STRATEGY in ['auto', 'system']:
-            try:
-                print("  尝试使用系统 PATH 中的 ChromeDriver...")
-                driver = webdriver.Chrome(options=options)
-                print("  ✓ 使用系统 ChromeDriver 成功")
-            except Exception as e:
-                print(f"  ⚠️ 系统 ChromeDriver 失败: {e}")
-        if driver is None and DRIVER_STRATEGY in ['auto', 'local']:
-            try:
-                from selenium.webdriver.chrome.service import Service
-                local_driver_path = os.path.join(os.path.dirname(__file__), 'chromedriver.exe')
-                if os.path.exists(local_driver_path):
-                    print(f"  尝试使用本地 ChromeDriver: {local_driver_path}")
-                    service = Service(local_driver_path)
-                    driver = webdriver.Chrome(service=service, options=options)
-                    print("  ✓ 使用本地 ChromeDriver 成功")
-                else:
-                    if DRIVER_STRATEGY == 'local':
-                        print(f"  ⚠️ 本地未找到 chromedriver.exe")
-            except Exception as e:
-                print(f"  ⚠️ 本地 ChromeDriver 失败: {e}")
-    if driver is None:
-        print("\n" + "="*70)
-        print(f"❌ 无法启动 {browser_name} 浏览器！")
-        print("="*70)
-        if USE_EDGE:
-            print("\n请选择以下解决方案之一:\n")
-            print("方案 1 (推荐): 安装 webdriver-manager")
-            print("  pip install webdriver-manager")
-            print()
-            print("方案 2: 确认 Edge 浏览器已安装")
-            print("  Edge 浏览器路径通常在:")
-            print("  C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe")
-            print()
-            print("方案 3: 手动下载 EdgeDriver")
-            print("  1. 查看 Edge 版本: edge://version/")
-            print("  2. 下载匹配版本: https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/")
-            print(f"  3. 解压 msedgedriver.exe 到: {os.path.dirname(__file__)}")
-            print()
-            print("方案 4: 改用 Chrome 浏览器")
-            print("  在脚本中设置: USE_EDGE = False")
-        else:
-            print("\n请选择以下解决方案之一:\n")
-            print("方案 1 (推荐): 安装 webdriver-manager")
-            print("  pip install webdriver-manager")
-            print()
-            print("方案 2: 手动下载 ChromeDriver")
-            print("  1. 查看 Chrome 版本: chrome://version/")
-            print("  2. 下载匹配版本: https://chromedriver.chromium.org/downloads")
-            print("     或: https://googlechromelabs.github.io/chrome-for-testing/")
-            print(f"  3. 解压 chromedriver.exe 到: {os.path.dirname(__file__)}")
-            print()
-            print("方案 3: 使用国内镜像下载")
-            print("  https://registry.npmmirror.com/binary.html?path=chromedriver/")
-            print()
-            print("方案 4: 改用 Edge 浏览器")
-            print("  在脚本中设置: USE_EDGE = True")
-        print("="*70)
-        raise Exception(f"无法创建 {browser_name} WebDriver，请按照上述方案解决")
-    driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-        'source': 'Object.defineProperty(navigator, "webdriver", {get: () => undefined})'
-    })
-    return driver
-
-def login_with_browser(driver, username, password):
-    try:
-        print("步骤 1/6: 访问登录页面...")
-        driver.get(f"{BASE_URL}/")
-        wait = WebDriverWait(driver, 15)
-        username_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[id*='urn']")))
-        print("步骤 2/6: 输入用户名和密码...")
-        username_input.clear()
-        username_input.send_keys(username)
-        password_input = driver.find_element(By.CSS_SELECTOR, "input[id*='pwd']")
-        password_input.clear()
-        password_input.send_keys(password)
-        print("步骤 3/6: 点击登录按钮...")
-        login_button = driver.find_element(By.CSS_SELECTOR, "button[id*='login']")
-        login_button.click()
-        wait.until(lambda d: "Default.jspx" in d.current_url or "ExamCase" in d.current_url or len(d.current_url) > len(BASE_URL) + 10)
-        print(f"当前URL: {driver.current_url}")
-        if "Default.jspx" in driver.current_url or "talk" in driver.current_url:
-            print("✅ 登录成功！")
-            return True
-        else:
-            print(f"⚠️ 登录可能失败，当前URL: {driver.current_url}")
-            return False
-    except Exception as e:
-        print(f"❌ 登录过程中发生错误: {e}")
-        with open('debug_login_error.html', 'w', encoding='utf-8') as f:
-            f.write(driver.page_source)
-        print("已将页面保存到 debug_login_error.html")
-        return False
-
-def auto_exam_process(driver):
-    try:
-        print(f"步骤 4/6: 访问考试页面...")
-        print(f"URL: {EXAM_URL}")
-        driver.get(EXAM_URL)
-        print(f"当前URL: {driver.current_url}")
-        try:
-            wait = WebDriverWait(driver, 3)
-            start_button = wait.until(
-                EC.element_to_be_clickable((By.XPATH, "//button[contains(@onclick, 'begin')]"))
-            )
-            print("✅ 发现'开始考试'按钮，点击开始...")
-            driver.execute_script("arguments[0].scrollIntoView(true);", start_button)
-            start_button.click()
-            print("已点击'开始考试'")
-        except Exception as e:
-            print("ℹ️ 未发现'开始考试'弹窗，可能已经在考试页面")
-        wait = WebDriverWait(driver, 10)
-        wait.until(EC.presence_of_element_located((By.ID, "myForm")))
-        print("✅ 考试页面已加载")
-        print("步骤 5/6: 提交试卷...")
-        submit_success = False
-        try:
-            submit_button = driver.find_element(By.ID, "myForm:subcase")
-            driver.execute_script("arguments[0].scrollIntoView(true);", submit_button)
-            submit_button.click()
-            print("✅ 已点击'提交试卷'按钮 (方法1: ID)")
-            submit_success = True
-        except Exception as e1:
-            try:
-                submit_button = driver.find_element(By.XPATH, "//button[contains(text(), '提交')]")
-                driver.execute_script("arguments[0].scrollIntoView(true);", submit_button)
-                submit_button.click()
-                print("✅ 已点击'提交'按钮 (方法2: 文本)")
-                submit_success = True
-            except Exception as e2:
-                try:
-                    print("尝试使用JavaScript提交...")
-                    driver.execute_script("""
-                        var btn = document.getElementById('myForm:subcase');
-                        if (btn) {
-                            btn.click();
-                        } else {
-                            if (typeof jQuery !== 'undefined') {
-                                jQuery('#myForm\\\\:subcase').trigger('click');
-                            }
-                        }
-                    """)
-                    print("✅ 已使用JavaScript提交 (方法3)")
-                    submit_success = True
-                except Exception as e3:
-                    print(f"❌ 方法3也失败: {e3}")
-        if not submit_success:
-            print("❌ 所有提交方法都失败了")
-            return None
-        try:
-            confirm_button = WebDriverWait(driver, 2).until(
-                EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), '提交') or contains(text(), '确定')]"))
-            )
-            confirm_button.click()
-            print("✅ 已点击确认提交对话框")
-        except:
-            print("ℹ️ 没有确认对话框或已自动提交")
-        print("等待跳转到报告页面...")
-        wait = WebDriverWait(driver, 15)
-        try:
-            wait.until(
-                EC.any_of(
-                    EC.url_contains("ExamCaseResult.jspx"),
-                    EC.url_contains("ExamCaseReport"),
-                    EC.url_contains("Report")
-                )
-            )
-
-            current_url = driver.current_url
-            if "ExamCaseResult.jspx" in current_url:
-                try:
-                    view_details_btn = wait.until(
-                        EC.element_to_be_clickable((By.XPATH, "//button[contains(., '查看详情')]"))
-                    )
-                    print("✅ 发现'查看详情'按钮，点击进入报告页面...")
-                    view_details_btn.click()
-                    wait.until(
-                        EC.any_of(
-                            EC.url_contains("ExamCaseReport"),
-                            EC.url_contains("Report")
-                        )
-                    )
-                except Exception:
-                    print("ℹ️  在结果页上未找到'查看详情'按钮或点击后未跳转，尝试直接解析当前页")
-
-            print(f"✅ 步骤 6/6: 成功进入报告页面!")
-            return driver.page_source
-
-        except Exception:
-            print("❌ 等待超时，未能跳转到报告页面")
-            print(f"最终URL: {driver.current_url}")
-            return None
-    except Exception as e:
-        print(f"❌ 自动化考试流程出错: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            with open('debug_exam_process_error.html', 'w', encoding='utf-8') as f:
-                f.write(driver.page_source)
-            print(f"当前URL: {driver.current_url}")
-            print("已将页面保存到 debug_exam_process_error.html")
-        except:
-            pass
-        return None
 
 def parse_report_page(html_content, question_bank):
     def is_question_title(tag):
@@ -415,10 +495,8 @@ def parse_report_page(html_content, question_bank):
     panels = soup.select('.ui-panel-content')
 
     if not panels:
-        print('⚠️ 警告：未找到 .ui-panel-content 容器，页面结构可能已变更')
-        return question_bank
+        return question_bank, 0
 
-    print(f'✅ 找到 {len(panels)} 个面板容器')
     new_questions_found = 0
 
     for panel in panels:
@@ -458,23 +536,19 @@ def parse_report_page(html_content, question_bank):
             correct_answer = normalize_answer(correct_answer)
 
             if clean_text and correct_answer:
-                is_new = clean_text not in question_bank
-                record = question_bank.setdefault(clean_text, {})
-                record['answer'] = correct_answer
-                if options:
-                    unique_options = list(dict.fromkeys(opt for opt in options if opt))
-                    if unique_options:
-                        record['options'] = unique_options
-                if is_new:
-                    new_questions_found += 1
-                    print(f'  新增题目: {clean_text[:30]}... => {correct_answer}')
+                with question_bank_lock:
+                    is_new = clean_text not in question_bank
+                    record = question_bank.setdefault(clean_text, {})
+                    record['answer'] = correct_answer
+                    if options:
+                        unique_options = list(dict.fromkeys(opt for opt in options if opt))
+                        if unique_options:
+                            record['options'] = unique_options
+                    if is_new:
+                        new_questions_found += 1
 
-    if new_questions_found:
-        print(f'✅ 成功解析并添加/更新 {new_questions_found} 个题目')
-    else:
-        print('ℹ️ 报告页面解析完成，没有发现新问题')
+    return question_bank, new_questions_found
 
-    return question_bank
 
 def count_categories(bank):
     counts = {"单选题": 0, "多选题": 0, "判断题": 0}
@@ -487,6 +561,7 @@ def count_categories(bank):
         else:
             counts['单选题'] += 1
     return counts
+
 
 def plot_results(history):
     if not history or not history.get('total') or len(history['total']) < 1:
@@ -531,11 +606,90 @@ def plot_results(history):
     except:
         pass
 
+
+def get_user_input():
+    global USERNAME, PASSWORD, EXAM_URL, LOOP_COUNT
+    if not USERNAME:
+        USERNAME = input("请输入您的用户名: ")
+    if not PASSWORD:
+        PASSWORD = input("请输入您的密码: ")
+    if not EXAM_URL:
+        EXAM_URL = input("请输入考试的 URL: ")
+    if LOOP_COUNT is None:
+        while True:
+            try:
+                LOOP_COUNT = int(input("请输入循环次数: "))
+                break
+            except ValueError:
+                print("请输入一个有效的数字。")
+
+
+def worker_task(worker_id, task_range, question_bank, results, history_records):
+    crawler = ExamCrawler(worker_id)
+    local_added = 0
+    local_completed = 0
+    
+    try:
+        max_login_retries = 5
+        login_success = False
+        for retry in range(max_login_retries):
+            if crawler.login(USERNAME, PASSWORD):
+                login_success = True
+                break
+            else:
+                if retry < max_login_retries - 1:
+                    wait_time = (retry + 1) * 2
+                    print(f"[Worker {worker_id}] ⚠️ 登录失败，{wait_time}秒后重试 ({retry + 1}/{max_login_retries})")
+                    time.sleep(wait_time)
+                    crawler.close()
+                    crawler = ExamCrawler(worker_id)
+        
+        if not login_success:
+            print(f"[Worker {worker_id}] ❌ 登录失败，已重试{max_login_retries}次")
+            return
+        
+        for i in task_range:
+            try:
+                report_html = crawler.do_exam()
+                
+                if report_html:
+                    _, added = parse_report_page(report_html, question_bank)
+                    local_added += added
+                    local_completed += 1
+                    
+                    with question_bank_lock:
+                        current_total = len(question_bank)
+                        cats = count_categories(question_bank)
+                        history_records.append({
+                            'timestamp': time.time(),
+                            'total': current_total,
+                            'single': cats['单选题'],
+                            'multi': cats['多选题'],
+                            'judge': cats['判断题']
+                        })
+                    
+                    if added > 0:
+                        print(f"[Worker {worker_id}] 第 {i} 次完成，新增 {added} 题，当前共 {current_total} 题")
+                    else:
+                        print(f"[Worker {worker_id}] 第 {i} 次完成，无新题")
+                else:
+                    print(f"[Worker {worker_id}] 第 {i} 次失败")
+                    
+            except Exception as e:
+                print(f"[Worker {worker_id}] 第 {i} 次出错: {e}")
+                
+    finally:
+        crawler.close()
+        results[worker_id] = {'added': local_added, 'completed': local_completed}
+
+
 def main():
     print("=" * 70)
     print(" " * 20 + "南林考试系统自动爬虫")
     print("=" * 70)
+    
     get_user_input()
+    
     question_bank = load_question_bank()
     history = {
         'total': [],
@@ -543,92 +697,138 @@ def main():
         'multi': [],
         'judge': []
     }
+    
     initial_q_count = len(question_bank)
     print(f"\n📚 启动时，题库中已有 {initial_q_count} 道题目")
-    print(f"🌐 使用浏览器: {'Edge' if USE_EDGE else 'Chrome'}")
-    print(f"🖥️  无头模式: {'开启 (不显示浏览器窗口)' if HEADLESS else '关闭 (显示浏览器窗口)'}")
     print(f"🔄 计划循环次数: {LOOP_COUNT}")
+    print(f"⚡ 并行线程数: {PARALLEL_WORKERS}")
+    if DEBUG:
+        print(f"🐛 调试模式: 开启")
     print()
-    driver = None
-    try:
-        for i in range(1, LOOP_COUNT + 1):
-            print("\n" + "=" * 70)
-            print(f"{'  第 ' + str(i) + '/' + str(LOOP_COUNT) + ' 次循环':^70}")
-            print("=" * 70)
-            try:
-                if driver is None:
-                    browser_name = "Edge" if USE_EDGE else "Chrome"
-                    print(f"🚀 正在启动 {browser_name} 浏览器...")
-                    driver = create_driver()
-                    print(f"✅ {browser_name} 浏览器启动成功")
-                else:
-                    print("ℹ️  使用已有浏览器实例...")
-                if i == 1:
-                    if not login_with_browser(driver, USERNAME, PASSWORD):
-                        print("❌ 登录失败，终止程序")
-                        break
-                else:
-                    print("ℹ️  使用已有登录会话...")
-                report_html = auto_exam_process(driver)
-                if not report_html:
-                    print("❌ 无法获取报告页面，跳过本次循环")
-                    continue
-                print("\n📖 正在解析报告页面...")
-                old_count = len(question_bank)
-                question_bank = parse_report_page(report_html, question_bank)
-                new_count = len(question_bank)
-                added = new_count - old_count
-                cats = count_categories(question_bank)
-                history['total'].append(new_count)
-                history['single'].append(cats['单选题'])
-                history['multi'].append(cats['多选题'])
-                history['judge'].append(cats['判断题'])
+    
+    start_time = time.time()
+    
+    if PARALLEL_WORKERS > 1:
+        print(f"🚀 启动 {PARALLEL_WORKERS} 个并行工作线程...")
+        print("=" * 70)
+        
+        tasks_per_worker = LOOP_COUNT // PARALLEL_WORKERS
+        remainder = LOOP_COUNT % PARALLEL_WORKERS
+        
+        task_ranges = []
+        current = 1
+        for w in range(PARALLEL_WORKERS):
+            count = tasks_per_worker + (1 if w < remainder else 0)
+            if count > 0:
+                task_ranges.append(list(range(current, current + count)))
+                current += count
+        
+        results = {}
+        history_records = []
+        
+        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+            futures = []
+            for worker_id, task_range in enumerate(task_ranges):
+                if task_range:
+                    future = executor.submit(worker_task, worker_id, task_range, question_bank, results, history_records)
+                    futures.append(future)
+            
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Worker 异常: {e}")
+        
+        history_records.sort(key=lambda x: x['timestamp'])
+        for record in history_records:
+            history['total'].append(record['total'])
+            history['single'].append(record['single'])
+            history['multi'].append(record['multi'])
+            history['judge'].append(record['judge'])
+        
+        total_added = sum(r.get('added', 0) for r in results.values())
+        total_completed = sum(r.get('completed', 0) for r in results.values())
+        
+        print("\n" + "=" * 70)
+        print(f"📊 并行执行完成")
+        print(f"   完成次数: {total_completed}/{LOOP_COUNT}")
+        print(f"   新增题目: {total_added}")
+        
+    else:
+        crawler = ExamCrawler()
+        
+        try:
+            for i in range(1, LOOP_COUNT + 1):
                 print("\n" + "=" * 70)
-                print(f"  ✅ 第 {i} 次循环完成")
-                print(f"  📈 本次新增: {added} 道题")
-                print(f"  📚 当前统计: 总计 {new_count} | 单选 {cats['单选题']} | 多选 {cats['多选题']} | 判断 {cats['判断题']}")
+                print(f"{'  第 ' + str(i) + '/' + str(LOOP_COUNT) + ' 次循环':^70}")
                 print("=" * 70)
-            except Exception as e:
-                print(f"\n❌ 循环 {i} 中发生错误: {e}")
-                import traceback
-                traceback.print_exc()
-                if i == 1:
-                    browser_name = "Edge" if USE_EDGE else "Chrome"
-                    print("\n⚠️ 第一次循环失败，可能是环境配置问题")
-                    print("请检查:")
-                    print(f"  1. {browser_name} 浏览器是否已安装")
-                    print(f"  2. {browser_name}Driver 是否正确配置")
-                    print("  3. 网络连接是否正常")
-                    if USE_EDGE:
-                        print("\n提示: Edge 通常已预装在 Windows 10/11 系统中")
-                        print("  如果 Edge 未安装，可以:")
-                        print("  - 下载安装: https://www.microsoft.com/edge")
-                        print("  - 或设置 USE_EDGE = False 改用 Chrome")
-                    break
-            if i < LOOP_COUNT:
-                print(f"\n🚀 准备下一次循环...")
-    finally:
-        if driver:
-            print("\n🔒 正在关闭浏览器...")
-            try:
-                driver.quit()
-                print("✅ 浏览器已关闭")
-            except:
-                pass
+                
+                try:
+                    if i == 1:
+                        if not crawler.login(USERNAME, PASSWORD):
+                            print("❌ 登录失败，终止程序")
+                            break
+                    else:
+                        print("ℹ️  使用已有登录会话...")
+                    
+                    report_html = crawler.do_exam()
+                    
+                    if not report_html:
+                        print("❌ 无法获取报告页面，跳过本次循环")
+                        continue
+                    
+                    print("\n📖 正在解析报告页面...")
+                    old_count = len(question_bank)
+                    question_bank, added = parse_report_page(report_html, question_bank)
+                    new_count = len(question_bank)
+                    
+                    cats = count_categories(question_bank)
+                    history['total'].append(new_count)
+                    history['single'].append(cats['单选题'])
+                    history['multi'].append(cats['多选题'])
+                    history['judge'].append(cats['判断题'])
+                    
+                    print("\n" + "=" * 70)
+                    print(f"  ✅ 第 {i} 次循环完成")
+                    print(f"  📈 本次新增: {added} 道题")
+                    print(f"  📚 当前统计: 总计 {new_count} | 单选 {cats['单选题']} | 多选 {cats['多选题']} | 判断 {cats['判断题']}")
+                    print("=" * 70)
+                    
+                except Exception as e:
+                    print(f"\n❌ 循环 {i} 中发生错误: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    
+                    if i == 1:
+                        print("\n⚠️ 第一次循环失败")
+                        break
+                    
+        finally:
+            crawler.close()
+    
+    elapsed_time = time.time() - start_time
+    
     print("\n" + "=" * 70)
+    print(f"⏱️  总耗时: {elapsed_time:.1f} 秒")
+    
     if len(question_bank) > initial_q_count:
         save_question_bank(question_bank)
         total_added = len(question_bank) - initial_q_count
         print(f"✅ 题库已更新：从 {initial_q_count} 增加到 {len(question_bank)} 道题")
         print(f"📈 本次运行共新增 {total_added} 道题")
+        if elapsed_time > 0:
+            print(f"🚀 平均速度: {total_added / elapsed_time * 60:.1f} 题/分钟")
     else:
         print("ℹ️  题库没有更新")
+    
     if history['total']:
         print("\n📊 正在生成题库增长图表...")
         plot_results(history)
+    
     print("\n" + "=" * 70)
     print(" " * 28 + "🎉 任务完成！")
     print("=" * 70)
+
 
 if __name__ == "__main__":
     try:
@@ -639,7 +839,3 @@ if __name__ == "__main__":
         print(f"\n\n❌ 程序异常退出: {e}")
         import traceback
         traceback.print_exc()
-
-
-
-
