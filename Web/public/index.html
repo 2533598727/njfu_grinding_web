@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>在线刷题系统</title>
+    <link rel="stylesheet" href="css/style.css">
+    <!-- Chart.js用于统计图表 -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- 顶部导航栏 -->
+        <header>
+            <h1>在线刷题系统</h1>
+            <div class="header-right">
+                <div class="user-info" id="userInfo">
+                    <span id="userName">游客</span>
+                    <button id="loginBtn" class="login-btn">登录</button>
+                </div>
+                <div class="score-board">
+                    <span>得分: <span id="score">0</span></span>
+                    <span>已答: <span id="answered">0</span>/<span id="total">0</span></span>
+                </div>
+            </div>
+        </header>
+
+        <!-- 登录模态框 -->
+        <div id="loginModal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2>用户登录</h2>
+                    <span class="close">&times;</span>
+                </div>
+                <form id="loginForm">
+                    <div class="form-group">
+                        <label for="username">用户名:</label>
+                        <input type="text" id="username" name="username" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="password">密码:</label>
+                        <input type="password" id="password" name="password" required>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" id="registerBtn" class="register-btn">注册</button>
+                        <button type="submit" class="login-btn">登录</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- 设置模态框 -->
+        <div id="settingsModal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2>设置</h2>
+                    <span class="close">&times;</span>
+                </div>
+                <div class="settings-content">
+                    <!-- 主题设置 -->
+                    <div class="setting-group">
+                        <h3>主题设置</h3>
+                        <div class="theme-options">
+                            <label>
+                                <input type="radio" name="theme" value="light" checked>
+                                <span>白天主题</span>
+                            </label>
+                            <label>
+                                <input type="radio" name="theme" value="dark">
+                                <span>夜间主题</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- 背景设置 -->
+                    <div class="setting-group">
+                        <h3>背景设置</h3>
+                        <div class="background-options">
+                            <label>
+                                <input type="radio" name="background" value="auto" checked>
+                                <span>随主题自动切换</span>
+                            </label>
+                            <label>
+                                <input type="radio" name="background" value="custom">
+                                <span>自定义背景图片</span>
+                            </label>
+                        </div>
+                        <div class="background-upload" style="margin-top: 15px; display: none;">
+                            <input type="file" id="backgroundImage" accept="image/*">
+                            <button type="button" id="removeBackground">移除背景图片</button>
+                        </div>
+                    </div>
+
+                    <!-- 答题正确跳转时间 -->
+                    <div class="setting-group">
+                        <h3>答题正确跳转时间</h3>
+                        <div class="jump-time-setting">
+                            <label for="correctJumpTime">正确答案跳转时间（秒）:</label>
+                            <input type="range" id="correctJumpTime" min="1" max="5" value="2.5" step="0.5">
+                            <span id="correctJumpTimeValue">2.5</span>秒
+                        </div>
+                    </div>
+
+                    <!-- 答题错误跳转时间 -->
+                    <div class="setting-group">
+                        <h3>答题错误跳转时间</h3>
+                        <div class="jump-time-setting">
+                            <label for="wrongJumpTime">错误答案跳转时间（秒）:</label>
+                            <input type="range" id="wrongJumpTime" min="1" max="5" value="3.5" step="0.5">
+                            <span id="wrongJumpTimeValue">3.5</span>秒
+                        </div>
+                    </div>
+
+                    <!-- 支持作者 -->
+                    <div class="setting-group">
+                        <h3>支持作者</h3>
+                        <div class="support-section">
+                            <p>如果觉得这个网站对你有帮助，欢迎支持作者赚点爱心钱~</p>
+                            <div class="support-image">
+                                <img src="支持.JPG" alt="支持二维码" style="max-width: 200px; cursor: pointer; border: 1px solid #ccc; border-radius: 8px;" onclick="alert('感谢您的支持！')">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-actions">
+                        <button type="button" id="saveSettings" class="login-btn">保存设置</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 禅语展示区 -->
+        <div class="zen-section" id="zenSection">
+            <div class="zen-quote" id="zenQuote">千里之行，始于足下</div>
+        </div>
+
+        <!-- 主要内容区域 -->
+        <div class="main-content">
+            <!-- 左侧侧边栏 -->
+            <aside class="sidebar">
+                <div class="sidebar-section">
+                    <h3>科目选择</h3>
+                    <div class="subject-list" id="subjectList">
+                        <!-- 动态生成科目列表 -->
+                    </div>
+                </div>
+
+                <div class="sidebar-section">
+                    <h3>模式选择</h3>
+                    <div class="mode-buttons">
+                        <button class="mode-btn active" data-mode="sequence" onclick="exam.selectMode('sequence', event)">顺序刷题</button>
+                        <button class="mode-btn" data-mode="random" onclick="exam.selectMode('random', event)">随机刷题</button>
+                        <button class="mode-btn" data-mode="memorize" onclick="exam.selectMode('memorize', event)">背题模式</button>
+                        <button class="mode-btn" data-mode="wrong" onclick="exam.selectMode('wrong', event)">错题本</button>
+                    </div>
+                </div>
+
+                <div class="sidebar-section" id="questionNav" style="display: none;">
+                    <h3>题目导航</h3>
+                    <div class="question-list" id="questionList">
+                        <!-- 动态生成题目导航 -->
+                    </div>
+                </div>
+
+                <div class="sidebar-section">
+                    <button id="statsBtn" class="stats-btn" onclick="exam.showStats()">统计分析</button>
+                    <button id="settingsBtn" class="settings-btn" onclick="exam.showSettings()">设置</button>
+                </div>
+            </aside>
+
+            <!-- 右侧主要内容 -->
+            <main class="content">
+                <!-- 题型选择 -->
+                <div class="type-selector">
+                    <h2>选择题型</h2>
+                    <div class="type-buttons" id="typeButtons">
+                        <!-- 动态生成题型按钮 -->
+                    </div>
+                </div>
+
+                <!-- 统计分析区域 -->
+                <div class="stats-section" id="statsSection" style="display: none;">
+                    <h2>学习统计</h2>
+                    <div class="stats-container">
+                        <div class="chart-box">
+                            <canvas id="scoreChart"></canvas>
+                        </div>
+                        <div class="stats-summary">
+                            <div class="stat-item">
+                                <h3>总答题数</h3>
+                                <span id="totalAnswered">0</span>
+                            </div>
+                            <div class="stat-item">
+                                <h3>正确率</h3>
+                                <span id="correctRate">0%</span>
+                            </div>
+                            <div class="stat-item">
+                                <h3>平均得分</h3>
+                                <span id="avgScore">0</span>
+                            </div>
+                            <div class="stat-item">
+                                <h3>错题数</h3>
+                                <span id="wrongCount">0</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 题目区域 -->
+                <div class="question-section" id="questionSection" style="display: none;">
+                    <!-- 进度条 -->
+                    <div class="progress-section">
+                        <div class="progress-info">
+                            <span>答题进度</span>
+                            <span id="progressText">0%</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progressFill"></div>
+                        </div>
+                    </div>
+                    
+                    <div class="question-header">
+                        <h2 id="questionType">单选题</h2>
+                        <div class="question-nav">
+                            <button id="prevBtn" class="nav-btn">上一题</button>
+                            <span id="questionIndex">1/10</span>
+                            <button id="nextBtn" class="nav-btn">下一题</button>
+                        </div>
+                    </div>
+
+                    <div class="question-content">
+                        <div class="question-text" id="questionText">
+                            <!-- 题目内容 -->
+                        </div>
+                        
+                        <div class="options" id="options">
+                            <!-- 动态生成选项 -->
+                        </div>
+
+                        <div class="answer-result" id="answerResult" style="display: none;">
+                            <div class="result-message" id="resultMessage"></div>
+                            <div class="correct-answer" id="correctAnswer"></div>
+                        </div>
+                    </div>
+
+                    <div class="action-buttons">
+                        <button id="submitBtn" class="submit-btn">提交答案</button>
+                        <button id="resetBtn" class="reset-btn">重新答题</button>
+                    </div>
+                </div>
+            </main>
+        </div>
+
+        <!-- 底部信息 -->
+        <footer>
+            <p>© 2026 在线刷题系统 | 随时随地，轻松刷题</p>
+            <p class="source-info">题库来源：<a href="https://github.com/keggin-CHN/njfu_grinding/tree/main" target="_blank">https://github.com/keggin-CHN/njfu_grinding/tree/main</a></p>
+        </footer>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>

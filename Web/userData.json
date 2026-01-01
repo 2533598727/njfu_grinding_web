@@ -1,0 +1,52 @@
+{
+  "Lichu": {
+    "userAnswers": {
+      "sequence": {
+        "0": "C",
+        "1": "C"
+      }
+    },
+    "wrongQuestions": [
+      {
+        "text": "无产阶级革命是以政治革命为核心的社会革命，其根本问题是（  ）。",
+        "answer": "A",
+        "options": [
+          "A. 国家政权问题",
+          "B. 统一战线中的领导权问题",
+          "C. 武装斗争问题",
+          "D. 农民问题"
+        ]
+      }
+    ],
+    "stats": {
+      "totalAnswered": 2,
+      "correctCount": 1,
+      "wrongCount": 1,
+      "avgScore": 0,
+      "history": []
+    },
+    "typeStates": {
+      "2025-2026-1马原题库_单选题": {
+        "score": 1,
+        "answeredCount": 2,
+        "userAnswers": {
+          "0": "C",
+          "1": "C"
+        },
+        "isAnswered": true
+      },
+      "2025-2026-1马原题库_多选题": {
+        "score": 0,
+        "answeredCount": 0,
+        "userAnswers": {},
+        "isAnswered": true
+      },
+      "2025-2026-1马原题库_判断题": {
+        "score": 0,
+        "answeredCount": 0,
+        "userAnswers": {},
+        "isAnswered": true
+      }
+    }
+  }
+}
